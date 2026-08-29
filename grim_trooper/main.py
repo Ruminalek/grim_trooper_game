@@ -13,19 +13,28 @@ Controls:
 Levels 1-2 fit on one screen. From level 3 onward, the map grows wider
 and the camera scrolls to follow you.
 
-High scores are saved locally next to this script in
-grim_trooper_scores.json.
+High scores persist across sessions: a local JSON file next to this
+script on desktop, or the browser's localStorage (via pygbag's
+platform.window hook) when run through pygbag.
 
-Run with:  pip install pygame
-           python grim_trooper.py
+Run locally with:  pip install pygame
+                    python grim_trooper.py
+
+Deploy to the web with pygbag (https://github.com/pygame-web/pygbag):
+    pip install pygbag
+    pygbag .
+Then open the printed localhost URL, or use `pygbag --build .` to
+produce a static build for hosting. The game loop is already async
+(main() + asyncio.sleep(0) each frame) as pygbag requires.
 """
 
 import pygame
 import random
-import sys
 import math
 import json
 import os
+import sys
+import asyncio
 
 pygame.init()
 
@@ -165,8 +174,38 @@ def present():
 
 # ---------------------------------------------------------------------------
 # Score persistence
+#
+# On desktop this reads/writes a local JSON file next to the script.
+# In-browser (pygbag/emscripten) there is no real filesystem, so we use
+# pygbag's documented persistence hook instead: the browser's window
+# object, reached via `from platform import window`, giving direct access
+# to window.localStorage. (Pygbag doesn't expose a Python binding for
+# IndexedDB itself - localStorage is the mechanism it actually documents
+# for "persistent data across sessions", and it's synchronous, which
+# fits a simple JSON blob like our score list well.) Both paths land on
+# the same load_scores()/save_score() API so the rest of the game
+# doesn't need to know which backend is active.
 # ---------------------------------------------------------------------------
+LOCAL_STORAGE_KEY = "grim_trooper_scores"
+
+
+def _is_web():
+    return sys.platform == "emscripten"
+
+
 def load_scores():
+    if _is_web():
+        try:
+            from platform import window
+            raw = window.localStorage.getItem(LOCAL_STORAGE_KEY)
+            if raw:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        return []
+
     try:
         with open(SCORES_FILE, "r") as f:
             data = json.load(f)
@@ -182,6 +221,15 @@ def save_score(name, score, level):
     scores.append({"name": (name.strip() or "TROOPER")[:MAX_NAME_LEN], "score": score, "level": level})
     scores.sort(key=lambda e: e.get("score", 0), reverse=True)
     scores = scores[:20]
+
+    if _is_web():
+        try:
+            from platform import window
+            window.localStorage.setItem(LOCAL_STORAGE_KEY, json.dumps(scores))
+        except Exception:
+            pass
+        return scores
+
     try:
         with open(SCORES_FILE, "w") as f:
             json.dump(scores, f, indent=2)
@@ -212,27 +260,70 @@ ENEMY_TYPES = {
 }
 
 WEAPON_ORDER = ["gun", "melee", "grenade"]
-WEAPON_NAMES = {"gun": "BOLTER", "melee": "CHAIN BLADE", "grenade": "FRAG"}
+
+# Ranged and melee weapons are swappable loadouts within the "gun"/"melee"
+# slots. Picking up a weapon powerup replaces whichever is currently
+# equipped in that slot. Damage scales with levels_cleared * dmg_per_level.
+RANGED_WEAPONS = {
+    "gun": {
+        "name": "BOLTGUN", "dmg": 15, "dmg_per_level": 3, "cooldown": 14,
+        "ammo_cost": 1, "bullet_speed": 12, "max_range": None,
+        "bullet_color": (255, 210, 90), "barrel_color": (30, 30, 30),
+    },
+    "melta": {
+        "name": "MELTAGUN", "dmg": 45, "dmg_per_level": 6, "cooldown": 34,
+        "ammo_cost": 4, "bullet_speed": 9, "max_range": 150,
+        "bullet_color": (255, 130, 50), "barrel_color": (120, 50, 20),
+    },
+    "plasma": {
+        "name": "PLASMA RIFLE", "dmg": 30, "dmg_per_level": 4, "cooldown": 22,
+        "ammo_cost": 3, "bullet_speed": 10, "max_range": None,
+        "bullet_color": (90, 200, 255), "barrel_color": (40, 80, 120),
+    },
+}
+
+MELEE_WEAPONS = {
+    "blade": {"name": "CHAIN BLADE", "dmg": 35, "dmg_per_level": 5, "cooldown": 25, "reach": 40,
+              "color": (180, 180, 190)},
+    "chainsword": {"name": "CHAINSWORD", "dmg": 50, "dmg_per_level": 6, "cooldown": 20, "reach": 45,
+                   "color": (210, 60, 50)},
+    "fist": {"name": "POWER FIST", "dmg": 80, "dmg_per_level": 8, "cooldown": 48, "reach": 36,
+             "color": (255, 200, 60)},
+}
+
+# Which weapons become available as map pickups, and from what level.
+WEAPON_UNLOCKS = [
+    (4, "ranged", "melta"),
+    (4, "melee", "chainsword"),
+    (7, "ranged", "plasma"),
+    (7, "melee", "fist"),
+]
 
 
 # ---------------------------------------------------------------------------
 # Projectiles / effects
 # ---------------------------------------------------------------------------
 class Bullet:
-    def __init__(self, x, y, direction, from_player=True, dmg=10):
+    def __init__(self, x, y, direction, from_player=True, dmg=10, color=None, speed=None, max_range=None):
         self.rect = pygame.Rect(x, y, 10, 4)
+        self.start_x = x
         self.direction = direction
         self.from_player = from_player
         self.dmg = dmg
+        self.color = color
+        self.speed = speed if speed is not None else BULLET_SPEED
+        self.max_range = max_range
         self.alive = True
 
     def update(self, level_width):
-        self.rect.x += BULLET_SPEED * self.direction
+        self.rect.x += self.speed * self.direction
         if self.rect.x < -20 or self.rect.x > level_width + 20:
+            self.alive = False
+        if self.max_range is not None and abs(self.rect.x - self.start_x) > self.max_range:
             self.alive = False
 
     def draw(self, surf, camera_x):
-        color = COL_BULLET_PLAYER if self.from_player else COL_BULLET_ENEMY
+        color = self.color or (COL_BULLET_PLAYER if self.from_player else COL_BULLET_ENEMY)
         pygame.draw.rect(surf, color, self.rect.move(-camera_x, 0))
 
 
@@ -294,11 +385,13 @@ class Explosion:
 
 
 class Powerup:
-    """Armor and grenade pickups scattered across the map."""
+    """Armor, ammo, grenade, and weapon pickups scattered across the map."""
 
-    def __init__(self, x, y, ptype):
+    def __init__(self, x, y, ptype, weapon_slot=None, weapon_id=None):
         self.rect = pygame.Rect(x, y, 22, 22)
-        self.ptype = ptype  # "armor" or "grenade"
+        self.ptype = ptype  # "armor", "ammo", "grenade", or "weapon"
+        self.weapon_slot = weapon_slot  # "ranged" or "melee", only for ptype "weapon"
+        self.weapon_id = weapon_id
         self.alive = True
         self.bob_seed = random.uniform(0, math.pi * 2)
 
@@ -312,10 +405,30 @@ class Powerup:
             pygame.draw.rect(surf, (210, 210, 225), r.inflate(-4, -4), border_radius=4)
             pygame.draw.rect(surf, (170, 30, 30), (r.centerx - 2, r.top + 4, 4, r.height - 8))
             pygame.draw.rect(surf, (170, 30, 30), (r.left + 4, r.centery - 2, r.width - 8, 4))
-        else:
+        elif self.ptype == "grenade":
             pygame.draw.circle(surf, (30, 25, 20), r.center, 11)
             pygame.draw.circle(surf, COL_GRENADE, r.center, 9)
             pygame.draw.rect(surf, (150, 140, 60), (r.centerx - 2, r.top, 4, 5))
+        elif self.ptype == "ammo":
+            pygame.draw.rect(surf, (40, 34, 20), r, border_radius=4)
+            pygame.draw.rect(surf, (230, 200, 90), (r.left + 4, r.top + 4, r.width - 8, r.height - 10))
+            pygame.draw.polygon(surf, (230, 200, 90), [
+                (r.left + 4, r.top + 4), (r.right - 4, r.top + 4), (r.centerx, r.top - 4),
+            ])
+        elif self.ptype == "weapon":
+            color = (200, 200, 210)
+            letter = "?"
+            if self.weapon_slot == "ranged":
+                color = RANGED_WEAPONS[self.weapon_id]["bullet_color"]
+                letter = self.weapon_id[0].upper()
+            elif self.weapon_slot == "melee":
+                color = MELEE_WEAPONS[self.weapon_id]["color"]
+                letter = self.weapon_id[0].upper()
+            diamond = [(r.centerx, r.top), (r.right, r.centery), (r.centerx, r.bottom), (r.left, r.centery)]
+            pygame.draw.polygon(surf, (30, 25, 25), diamond)
+            pygame.draw.polygon(surf, color, diamond, width=3)
+            label = font_small.render(letter, True, color)
+            surf.blit(label, label.get_rect(center=r.center))
 
 
 # ---------------------------------------------------------------------------
@@ -409,13 +522,18 @@ class Player:
         self.score = 0
 
         self.weapon_index = 0
+        self.ranged_id = "gun"
+        self.melee_id = "blade"
         self.gun_cooldown = 0
         self.melee_cooldown = 0
         self.melee_flash = 0
         self.grenade_cooldown = 0
         self.grenade_count = 3
 
-        self.levels_cleared = 0  # scales bolter/blade damage as you progress
+        self.ammo = 40
+        self.max_ammo = 99
+
+        self.levels_cleared = 0  # scales weapon damage as you progress
 
         self.invuln = 0
 
@@ -451,19 +569,25 @@ class Player:
     def fire(self, bullets, grenades, enemies):
         weapon = self.weapon
         if weapon == "gun":
-            if self.gun_cooldown == 0:
-                self.gun_cooldown = 14
-                dmg = 15 + self.levels_cleared * 3
+            spec = RANGED_WEAPONS[self.ranged_id]
+            if self.gun_cooldown == 0 and self.ammo >= spec["ammo_cost"]:
+                self.gun_cooldown = spec["cooldown"]
+                self.ammo -= spec["ammo_cost"]
+                dmg = spec["dmg"] + self.levels_cleared * spec["dmg_per_level"]
                 bx = self.rect.centerx + (20 * self.facing)
                 by = self.rect.centery - 4
-                bullets.append(Bullet(bx, by, self.facing, from_player=True, dmg=dmg))
+                bullets.append(Bullet(
+                    bx, by, self.facing, from_player=True, dmg=dmg,
+                    color=spec["bullet_color"], speed=spec["bullet_speed"], max_range=spec["max_range"],
+                ))
 
         elif weapon == "melee":
+            spec = MELEE_WEAPONS[self.melee_id]
             if self.melee_cooldown == 0:
-                self.melee_cooldown = 25
+                self.melee_cooldown = spec["cooldown"]
                 self.melee_flash = 8
-                dmg = 35 + self.levels_cleared * 5
-                reach = 40
+                dmg = spec["dmg"] + self.levels_cleared * spec["dmg_per_level"]
+                reach = spec["reach"]
                 if self.facing > 0:
                     hit_rect = pygame.Rect(self.rect.right, self.rect.top, reach, self.rect.height)
                 else:
@@ -560,11 +684,13 @@ class Player:
         pygame.draw.rect(surf, COL_PLAYER_VISOR, (visor_x - 6, r.top + 6, 12, 4))
 
         if self.weapon == "gun":
+            spec = RANGED_WEAPONS[self.ranged_id]
             gun_x = r.centerx + (18 * self.facing)
-            pygame.draw.rect(surf, (30, 30, 30), (min(gun_x, r.centerx), r.centery - 3, 20, 6))
+            pygame.draw.rect(surf, spec["barrel_color"], (min(gun_x, r.centerx), r.centery - 3, 20, 6))
         elif self.weapon == "melee":
+            spec = MELEE_WEAPONS[self.melee_id]
             blade_x = r.centerx + (16 * self.facing)
-            pygame.draw.line(surf, (180, 180, 190), (r.centerx, r.centery), (blade_x, r.centery), 4)
+            pygame.draw.line(surf, spec["color"], (r.centerx, r.centery), (blade_x, r.centery), 4)
             if self.melee_flash > 0:
                 reach = 40
                 fx = r.right if self.facing > 0 else r.left - reach
@@ -601,18 +727,33 @@ BASE_SPAWN_SLOTS = [
 PLATFORM_HEIGHTS = [220, 280, 350, 420]
 
 
-def _scatter_powerups(platforms, rng, count):
+def _scatter_powerups(platforms, rng, count, level):
+    """Place powerups on top of a random sample of non-ground platforms.
+    Ammo pickups are always in the mix; weapon pickups only start
+    appearing once a tier is unlocked (see WEAPON_UNLOCKS)."""
     non_ground = platforms[1:]
     if not non_ground:
         return []
     count = min(count, len(non_ground))
     chosen = rng.sample(non_ground, k=count)
+
+    weapon_pool = [(slot, wid) for (unlock_level, slot, wid) in WEAPON_UNLOCKS if level >= unlock_level]
+
+    options = ["armor", "ammo", "grenade"]
+    weights = [0.35, 0.30, 0.20]
+    if weapon_pool:
+        options.append("weapon")
+        weights.append(0.15)
+
     specs = []
     for p in chosen:
-        ptype = "armor" if rng.random() < 0.55 else "grenade"
+        ptype = rng.choices(options, weights=weights, k=1)[0]
+        slot, wid = (None, None)
+        if ptype == "weapon":
+            slot, wid = rng.choice(weapon_pool)
         x = p.centerx - 11
         y = p.top - 26
-        specs.append((x, y, ptype))
+        specs.append((x, y, ptype, slot, wid))
     return specs
 
 
@@ -627,7 +768,7 @@ def build_level(level):
         platforms += [p.copy() for p in BASE_PLATFORMS]
         spawn_slots = list(BASE_SPAWN_SLOTS)
         rng = random.Random(500 + level)
-        powerup_specs = _scatter_powerups(platforms, rng, count=2)
+        powerup_specs = _scatter_powerups(platforms, rng, count=2, level=level)
         return platforms, spawn_slots, level_width, powerup_specs
 
     num_segments = level - 2
@@ -652,25 +793,36 @@ def build_level(level):
                 spawn_slots.append((x + 10, y - 44, patrol_min, patrol_max))
         x_cursor += SEGMENT_WIDTH
 
-    powerup_specs = _scatter_powerups(platforms, rng, count=2 + num_segments)
+    powerup_specs = _scatter_powerups(platforms, rng, count=2 + num_segments, level=level)
     return platforms, spawn_slots, level_width, powerup_specs
 
 
+def difficulty_factor(level):
+    """Gentle ramp for levels 1-5 so new runs are approachable; climbs
+    faster from level 6 onward to keep things challenging long-term."""
+    if level <= 5:
+        return 1 + 0.15 * (level - 1)   # lvl1=1.0 ... lvl5=1.6
+    return 1.6 + 0.35 * (level - 5)     # lvl6=1.95 ... lvl10=3.35
+
+
 def spawn_wave(level, spawn_slots):
-    difficulty = level
-    num_enemies = min(len(spawn_slots), 2 + level)
+    factor = difficulty_factor(level)
+    if level <= 5:
+        num_enemies = min(len(spawn_slots), level + 1)
+    else:
+        num_enemies = min(len(spawn_slots), 2 + level)
 
     pool = ["grunt"] * 5
-    if level >= 2:
+    if level >= 3:
         pool += ["scout"] * 3
-    if level >= 4:
+    if level >= 6:
         pool += ["heavy"] * 2
 
     enemies = []
     slots = random.sample(spawn_slots, k=min(num_enemies, len(spawn_slots)))
     for (x, y, pmin, pmax) in slots:
         etype = random.choice(pool)
-        enemies.append(Enemy(x, y, pmin, pmax, etype, difficulty=difficulty))
+        enemies.append(Enemy(x, y, pmin, pmax, etype, difficulty=factor))
     return enemies
 
 
@@ -751,13 +903,17 @@ def draw_ui(surf, player, level, theme):
     surf.blit(font_small.render(theme["name"], True, (150, 130, 100)), (SCREEN_W - 200, 96))
     surf.blit(font_small.render(player.name, True, (140, 120, 90)), (SCREEN_W - 110, 76))
 
-    weapon_label = f"{WEAPON_NAMES[player.weapon]}"
-    if player.weapon == "grenade":
-        weapon_label += f"  x{player.grenade_count}"
-    elif player.weapon in ("gun", "melee"):
-        weapon_label += f"  Lv{player.levels_cleared + 1}"
-    surf.blit(font_small.render(weapon_label, True, COL_UI_TEXT), (SCREEN_W - 220, 44))
-    surf.blit(font_small.render("[1] BOLTER  [2] BLADE  [3] FRAG", True, (140, 120, 90)),
+    weapon = player.weapon
+    if weapon == "gun":
+        spec = RANGED_WEAPONS[player.ranged_id]
+        weapon_label = f"{spec['name']} Lv{player.levels_cleared + 1}  AMMO {player.ammo}/{player.max_ammo}"
+    elif weapon == "melee":
+        spec = MELEE_WEAPONS[player.melee_id]
+        weapon_label = f"{spec['name']} Lv{player.levels_cleared + 1}"
+    else:
+        weapon_label = f"FRAG  x{player.grenade_count}"
+    surf.blit(font_small.render(weapon_label, True, COL_UI_TEXT), (SCREEN_W - 260, 44))
+    surf.blit(font_small.render("[1] RANGED  [2] MELEE  [3] FRAG", True, (140, 120, 90)),
               (SCREEN_W // 2 - 140, SCREEN_H - 22))
 
 
@@ -825,7 +981,7 @@ def draw_leaderboard(scores, latest_entry):
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def main():
+async def main():
     game_state = "menu"
     name_input = ""
     cursor_timer = 0
@@ -865,7 +1021,7 @@ def main():
                         player = Player(60, SCREEN_H - 100, name=(name_input.strip() or "TROOPER"))
                         enemies = spawn_wave(level, spawn_slots)
                         bullets, grenades, explosions = [], [], []
-                        powerups = [Powerup(x, y, ptype) for (x, y, ptype) in powerup_specs]
+                        powerups = [Powerup(x, y, ptype, slot, wid) for (x, y, ptype, slot, wid) in powerup_specs]
                         score_saved = False
                         latest_entry = None
                         game_state = "playing"
@@ -958,8 +1114,15 @@ def main():
                 if pu.alive and player.rect.colliderect(pu.rect):
                     if pu.ptype == "armor":
                         player.health = min(player.max_health, player.health + 35)
-                    else:
+                    elif pu.ptype == "grenade":
                         player.grenade_count += 2
+                    elif pu.ptype == "ammo":
+                        player.ammo = min(player.max_ammo, player.ammo + 25)
+                    elif pu.ptype == "weapon":
+                        if pu.weapon_slot == "ranged":
+                            player.ranged_id = pu.weapon_id
+                        elif pu.weapon_slot == "melee":
+                            player.melee_id = pu.weapon_id
                     pu.alive = False
 
             bullets = [b for b in bullets if b.alive]
@@ -1009,10 +1172,11 @@ def main():
                 platforms, spawn_slots, level_width, powerup_specs = build_level(level)
                 current_theme = theme_for_level(level)
                 player.grenade_count += 1
+                player.ammo = min(player.max_ammo, player.ammo + 15)
                 player.rect.topleft = (60, SCREEN_H - 100)
                 enemies = spawn_wave(level, spawn_slots)
                 bullets, grenades, explosions = [], [], []
-                powerups = [Powerup(x, y, ptype) for (x, y, ptype) in powerup_specs]
+                powerups = [Powerup(x, y, ptype, slot, wid) for (x, y, ptype, slot, wid) in powerup_specs]
                 game_state = "playing"
 
         elif game_state == "dead":
@@ -1033,9 +1197,10 @@ def main():
         elif game_state == "leaderboard":
             draw_leaderboard(top_scores, latest_entry)
 
+        await asyncio.sleep(0)  # yield to the browser event loop each frame (pygbag/asyncio)
+
     pygame.quit()
-    sys.exit()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
